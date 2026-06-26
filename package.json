@@ -39,7 +39,8 @@
 		"cacheable-node"
 	],
 	"scripts": {
-		"build": "rimraf ./dist && tsdown src/index.ts --format cjs,esm --dts --clean",
+		"build": "rm -rf ./dist && bun build src/index.ts --outdir ./dist --format cjs",
+		"prepare": "bun run build",
 		"prepublishOnly": "pnpm build",
 		"lint": "biome check --write --error-on-warnings",
 		"test": "pnpm lint && vitest run --coverage",
