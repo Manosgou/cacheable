@@ -1,0 +1,638 @@
+import { Stats, shorthandToTime } from "./utils";
+import { Hookified } from "hookified";
+
+export type NodeCacheOptions = {
+	stats?: boolean
+	/**
+	 * The standard ttl as number in seconds for every generated cache element. 0 = unlimited, If string, it will be in shorthand format like '1h' for 1 hour
+	 */
+	stdTTL?: number | string;
+	/**
+	 * The interval to check for expired items in seconds. Default is 600 = 5 minutes
+	 */
+	checkperiod?: number;
+	/**
+	 * If set to true (Default Setting), the cache will clone the returned items via get() functions.
+	 * This means that every time you set a value into the cache, node-cache makes a deep clone of it.
+	 * When you get that value back, you receive another deep clone.
+	 * This mimics the behavior of an external cache like Redis or Memcached, meaning mutations to the
+	 * returned object do not affect the cached copy (and vice versa). If set to false, the original
+	 * object will be returned, and mutations will affect the cached copy.
+	 */
+	useClones?: boolean;
+	/**
+	 * Delete expired items during an interval check or a single item on a get request. Default is true.
+	 */
+	deleteOnExpire?: boolean;
+	/**
+	 * The maximum number of keys that will be stored in the cache. Default is -1 = unlimited
+	 * If the limit is reached, it will no longer add any new items until some expire.
+	 */
+	maxKeys?: number;
+};
+
+export type PartialNodeCacheItem<T> = {
+	/**
+	 * The key of the item
+	 */
+	key: string | number;
+	/**
+	 * The value of the item
+	 */
+	value: T;
+	/**
+	 * The ttl of the item in seconds. 0 = unlimited
+	 */
+	ttl?: number;
+};
+
+export type NodeCacheItem<T> = PartialNodeCacheItem<T> & {
+	/**
+	 * The ttl of the item in milliseconds. 0 = unlimited
+	 */
+	ttl: number;
+};
+
+export enum NodeCacheErrors {
+	ECACHEFULL = "Cache max keys amount exceeded",
+	EKEYTYPE = "The key argument has to be of type `string` or `number`. Found: `__key`",
+	EKEYSTYPE = "The keys argument has to be an array.",
+	ETTLTYPE = "The ttl argument has to be a number or a string for shorthand ttl.",
+}
+
+export type NodeCacheStats = {
+	/**
+	 * The number of keys stored in the cache
+	 */
+	keys: number;
+	/**
+	 * The number of hits
+	 */
+	hits: number;
+	/**
+	 * The number of misses
+	 */
+	misses: number;
+	/**
+	 * The global key size count in approximately bytes
+	 */
+	ksize: number;
+	/**
+	 * The global value size count in approximately bytes
+	 */
+	vsize: number;
+};
+
+export class NodeCache<T> extends Hookified {
+	public readonly options: NodeCacheOptions = {
+		stdTTL: 0,
+		checkperiod: 600,
+		useClones: true,
+		deleteOnExpire: true,
+		maxKeys: -1,
+	};
+
+	public readonly store = new Map<string, NodeCacheItem<T>>();
+
+	private _stats: Stats;
+
+	private intervalId: number | NodeJS.Timeout = 0;
+
+	constructor(options?: NodeCacheOptions) {
+		super({ throwOnHookError: false });
+		this._stats = new Stats({ enabled: options?.stats ?? false })
+		if (options) {
+			this.options = { ...this.options, ...options };
+		}
+
+		this.startInterval();
+	}
+
+	/**
+	 * Sets a key value pair. It is possible to define a ttl (in seconds). Returns true on success.
+	 *
+	 * TTL behavior:
+	 * - `ttl > 0`: cache expires after the given number of seconds
+	 * - `ttl === 0`: cache indefinitely (overrides stdTTL)
+	 * - `ttl < 0`: store the value but it expires immediately on next access (matches original node-cache behavior)
+	 * - `ttl` omitted/undefined: use `stdTTL` from options (0 = unlimited if stdTTL is 0 or not set)
+	 * - `ttl` as string: shorthand format like '1h', '30s', '5m', '2d'
+	 *
+	 * @param {string | number} key - it will convert the key to a string
+	 * @param {T} value
+	 * @param {number | string} [ttl] - TTL in seconds. 0 = unlimited, negative = expires immediately, string = shorthand format
+	 * @returns {boolean} true on success
+	 * @throws {Error} If the `key` or `ttl` is of an invalid type.
+	 */
+	public set(key: string | number, value: T, ttl?: number | string): boolean {
+		// Check on key type
+		/* v8 ignore next -- @preserve */
+		if (typeof key !== "string" && typeof key !== "number") {
+			throw this.createError(NodeCacheErrors.EKEYTYPE, key);
+		}
+
+		// Check on ttl type
+		/* v8 ignore next -- @preserve */
+		if (
+			ttl !== undefined &&
+			typeof ttl !== "number" &&
+			typeof ttl !== "string"
+		) {
+			throw this.createError(NodeCacheErrors.ETTLTYPE, this.formatKey(key));
+		}
+
+		const keyValue = this.formatKey(key);
+		const existing = this.store.get(keyValue);
+		let expirationTimestamp = 0; // 0 = never delete
+
+		if (this.isNegativeTtl(ttl)) {
+			// Negative TTL: store with a past timestamp so it expires immediately on next access.
+			// Math.max(1, ...) ensures the timestamp is always > 0, since the expiration
+			// check only triggers for ttl > 0 (0 means "unlimited").
+			expirationTimestamp = Math.max(
+				1,
+				this.getExpirationTimestamp(
+					typeof ttl === "string" ? Number(ttl) : (ttl as number),
+				),
+			);
+		} else if (ttl !== undefined && (typeof ttl === "string" || ttl > 0)) {
+			// Explicit positive TTL or string shorthand overrides stdTTL
+			expirationTimestamp = this.resolveExpiration(ttl);
+		} else if (
+			ttl === undefined &&
+			this.options.stdTTL !== undefined &&
+			this.options.stdTTL !== 0
+		) {
+			// ttl omitted, fall back to stdTTL if set and non-zero
+			expirationTimestamp = this.resolveExpiration(this.options.stdTTL);
+		}
+		// ttl === 0 means cache indefinitely (expirationTimestamp stays 0)
+
+		// Check on max key size
+		/* v8 ignore next -- @preserve */
+		if (this.options.maxKeys) {
+			const { maxKeys } = this.options;
+			if (maxKeys > -1 && this.store.size >= maxKeys && !existing) {
+				throw this.createError(NodeCacheErrors.ECACHEFULL, this.formatKey(key));
+			}
+		}
+
+		this.store.set(keyValue, {
+			key: keyValue,
+			value,
+			ttl: expirationTimestamp,
+		});
+
+		// Event
+		this.emit("set", keyValue, value, expirationTimestamp);
+
+		if (existing) {
+			this._stats.decreaseKSize(keyValue);
+			this._stats.decreaseVSize(existing.value);
+		}
+
+		// Add the bytes to the stats
+		this._stats.incrementKSize(keyValue);
+		this._stats.incrementVSize(value);
+		this._stats.setCount(this.store.size);
+		return true;
+	}
+
+	/**
+	 * Sets multiple key val pairs. It is possible to define a ttl (seconds). Returns true on success.
+	 *
+	 * Each item follows the same TTL behavior as `set()`:
+	 * - Positive TTL: expires after the given seconds
+	 * - `0`: cache indefinitely
+	 * - Negative TTL: stored but expires immediately on next access
+	 * - Omitted: uses `stdTTL` from options
+	 *
+	 * @param {PartialNodeCacheItem<T>[]} data an array of key value pairs with optional ttl
+	 * @returns {boolean} true on success
+	 * @throws {Error} If `data` is not an array, or if any item has an invalid key or ttl type.
+	 */
+	public mset(data: Array<PartialNodeCacheItem<T>>): boolean {
+		// Check on keys type
+		/* v8 ignore next -- @preserve */
+		if (!Array.isArray(data)) {
+			throw this.createError(NodeCacheErrors.EKEYSTYPE);
+		}
+
+		for (const item of data) {
+			this.set(item.key, item.value, item.ttl);
+		}
+
+		return true;
+	}
+
+	/**
+	 * Gets a saved value from the cache. Returns a undefined if not found or expired. If the value was found it returns the value.
+	 * @param {string | number} key if the key is a number it will convert it to a string
+	 * @returns {T} the value or undefined
+	 */
+	public get(key: string | number): T | undefined {
+		const result = this.store.get(this.formatKey(key));
+		if (result) {
+			if (result.ttl > 0) {
+				if (result.ttl < Date.now()) {
+					this._stats.incrementMisses();
+					this.handleExpired(key, result);
+					return undefined;
+				}
+
+				this._stats.incrementHits();
+				if (this.options.useClones) {
+					return this.clone(result.value) as T;
+				}
+
+				return result.value;
+			}
+
+			this._stats.incrementHits();
+			if (this.options.useClones) {
+				return this.clone(result.value) as T;
+			}
+
+			return result.value;
+		}
+
+		this._stats.incrementMisses();
+		return undefined;
+	}
+
+	/**
+	 * Gets multiple saved values from the cache. Returns an empty object {} if not found or expired.
+	 * If the value was found it returns an object with the key value pair.
+	 * @param {Array<string | number} keys an array of keys
+	 * @returns {Record<string, T | undefined>} an object with the key as a property and the value as the value
+	 */
+	public mget<V = T>(
+		keys: Array<string | number>,
+	): Record<string, V | undefined> {
+		const result: Record<string, V | undefined> = Object.create(null) as Record<
+			string,
+			V | undefined
+		>;
+
+		for (const key of keys) {
+			const value = this.get(key);
+			/* v8 ignore next -- @preserve */
+			if (value) {
+				result[this.formatKey(key)] = value as V;
+			}
+		}
+
+		return result;
+	}
+
+	/**
+	 * Get the cached value and remove the key from the cache. Equivalent to calling get(key) + del(key).
+	 * Useful for implementing single use mechanism such as OTP, where once a value is read it will become obsolete.
+	 * @param {string | number} key
+	 * @returns {T | undefined} the value or undefined
+	 */
+	public take<V = T>(key: string | number): V | undefined {
+		const keyValue = this.formatKey(key);
+		const item = this.store.get(keyValue);
+		const exists = item ? !(item.ttl > 0 && item.ttl < Date.now()) : false;
+		const result = this.get(key);
+
+		if (exists) {
+			this.del(key);
+			if (this.options.useClones) {
+				return this.clone(result) as V;
+			}
+
+			return result as V;
+		}
+
+		return result as V;
+	}
+
+	/**
+	 * Delete a key. Returns the number of deleted entries. A delete will never fail.
+	 * @param {string | number | Array<string | number>} key if the key is a number it will convert it to a string. if an array is passed it will delete all keys in the array.
+	 * @returns {number} if it was successful it will return the count that was deleted
+	 */
+	public del(key: string | number | Array<string | number>): number {
+		if (Array.isArray(key)) {
+			return this.mdel(key);
+		}
+
+		const result = this.store.get(this.formatKey(key));
+		if (result) {
+			const keyValue = this.formatKey(key);
+			this.store.delete(keyValue);
+
+			// Event
+			this.emit("del", keyValue, result.value);
+
+			// Remove the bytes from the stats
+			this._stats.decreaseKSize(keyValue);
+			this._stats.decreaseVSize(result.value);
+			this._stats.setCount(this.store.size);
+			return 1;
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Delete all keys in Array that exist. Returns the number of deleted entries.
+	 * @param {Array<string | number>} keys an array of keys
+	 * @returns {number} the count of deleted keys
+	 */
+	public mdel(keys: Array<string | number>): number {
+		let result = 0;
+		for (const key of keys) {
+			result += this.del(key);
+		}
+
+		return result;
+	}
+
+	/**
+	 * Redefine the ttl of a key. Returns true if the key has been found and changed.
+	 * Otherwise returns false. If the ttl-argument isn't passed the default-TTL will be used.
+	 *
+	 * TTL behavior:
+	 * - `ttl > 0`: key expires after the given number of seconds
+	 * - `ttl === 0`: key lives indefinitely (overrides stdTTL)
+	 * - `ttl < 0`: key expires immediately on next access (matches original node-cache behavior)
+	 * - `ttl` omitted/undefined: use `stdTTL` from options (0 = unlimited if stdTTL is 0 or not set)
+	 * - `ttl` as string: shorthand format like '1h', '30s', '5m', '2d'
+	 *
+	 * @param {string | number} key if the key is a number it will convert it to a string
+	 * @param {number | string} [ttl] TTL in seconds. 0 = unlimited, negative = expires immediately, string = shorthand format
+	 * @returns {boolean} true if the key has been found and changed. Otherwise returns false.
+	 * @throws {Error} If the `ttl` is of an invalid type (must be a number or string).
+	 */
+	public ttl(key: string | number, ttl?: number | string): boolean {
+		// Check on ttl type
+		/* v8 ignore next -- @preserve */
+		if (
+			ttl !== undefined &&
+			typeof ttl !== "number" &&
+			typeof ttl !== "string"
+		) {
+			throw this.createError(NodeCacheErrors.ETTLTYPE, this.formatKey(key));
+		}
+
+		const result = this.store.get(this.formatKey(key));
+		if (result) {
+			if (this.isNegativeTtl(ttl)) {
+				// Negative TTL: set past timestamp so it expires immediately on next access.
+				// Math.max(1, ...) ensures the timestamp is always > 0, since the expiration
+				// check only triggers for ttl > 0 (0 means "unlimited").
+				result.ttl = Math.max(
+					1,
+					this.getExpirationTimestamp(
+						typeof ttl === "string" ? Number(ttl) : (ttl as number),
+					),
+				);
+			} else if (ttl !== undefined && (typeof ttl === "string" || ttl > 0)) {
+				// Explicit positive TTL or string shorthand
+				result.ttl = this.resolveExpiration(ttl);
+			} else if (ttl === 0) {
+				// Explicit 0 = unlimited
+				result.ttl = 0;
+			} else if (
+				this.options.stdTTL !== undefined &&
+				this.options.stdTTL !== 0
+			) {
+				// ttl omitted, fall back to stdTTL if set and non-zero
+				result.ttl = this.resolveExpiration(this.options.stdTTL);
+			} else {
+				// No ttl, no stdTTL = unlimited
+				result.ttl = 0;
+			}
+
+			this.store.set(this.formatKey(key), result);
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Receive the ttl of a key.
+	 * @param {string | number} key if the key is a number it will convert it to a string
+	 * @returns {number | undefined} 0 if this key has no ttl, undefined if this key is not in the cache,
+	 * a timestamp in ms representing the time at which this key will expire
+	 */
+	public getTtl(key: string | number): number | undefined {
+		const result = this.store.get(this.formatKey(key));
+		if (result) {
+			if (result.ttl === 0) {
+				return 0;
+			}
+
+			return result.ttl;
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * Returns an array of all existing keys. [ "all", "my", "keys", "foo", "bar" ]
+	 * @returns {string[]} an array of all keys
+	 */
+	public keys(): string[] {
+		const result: string[] = [];
+
+		for (const key of this.store.keys()) {
+			result.push(key);
+		}
+
+		return result;
+	}
+
+	/**
+	 * Returns boolean indicating if the key is cached. If the key has expired, it
+	 * will return false and the key will be removed from the cache when
+	 * `deleteOnExpire` is enabled (matches the original node-cache behavior).
+	 * @param {string | number} key if the key is a number it will convert it to a string
+	 * @returns {boolean} true if the key is cached and not expired
+	 */
+	public has(key: string | number): boolean {
+		const result = this.store.get(this.formatKey(key));
+		if (!result) {
+			return false;
+		}
+
+		if (result.ttl > 0 && result.ttl < Date.now()) {
+			this.handleExpired(key, result);
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Gets the stats of the cache
+	 * @returns {NodeCacheStats} the stats of the cache
+	 */
+	public getStats(): NodeCacheStats {
+		const stats = {
+			keys: this._stats.count,
+			hits: this._stats.hits,
+			misses: this._stats.misses,
+			ksize: this._stats.ksize,
+			vsize: this._stats.vsize,
+		};
+
+		return stats;
+	}
+
+	/**
+	 * Flush the whole data.
+	 * @returns {void}
+	 */
+	public flushAll(): void {
+		this.store.clear();
+		this.flushStats();
+		// Event
+		this.emit("flush");
+	}
+
+	/**
+	 * Flush the stats.
+	 * @returns {void}
+	 */
+	public flushStats(): void {
+		this._stats = new Stats({ enabled: true });
+		// Event
+		this.emit("flush_stats");
+	}
+
+	/**
+	 * Close the cache. This will clear the interval timeout which is set on check period option.
+	 * @returns {void}
+	 */
+	public close(): void {
+		this.stopInterval();
+	}
+
+	/**
+	 * Get the interval id
+	 * @returns {number | NodeJS.Timeout} the interval id
+	 */
+	public getIntervalId(): number | NodeJS.Timeout {
+		return this.intervalId;
+	}
+
+	public startInterval(): void {
+		if (this.options.checkperiod && this.options.checkperiod > 0) {
+			const checkPeriodinSeconds = this.options.checkperiod * 1000;
+			this.intervalId = setInterval(() => {
+				this.checkData();
+			}, checkPeriodinSeconds).unref();
+
+			return;
+		}
+
+		this.intervalId = 0;
+	}
+
+	public stopInterval(): void {
+		if (this.intervalId !== 0) {
+			clearInterval(this.intervalId);
+			this.intervalId = 0;
+		}
+	}
+
+	private formatKey(key: string | number): string {
+		return key.toString();
+	}
+
+	// biome-ignore lint/suspicious/noExplicitAny: type format
+	private clone(value: any): any {
+		if (value === null || value === undefined) {
+			return value;
+		}
+
+		if (typeof value !== "object") {
+			return value;
+		}
+
+		return structuredClone(value);
+	}
+
+	private getExpirationTimestamp(ttlInSeconds: number | string): number {
+		if (typeof ttlInSeconds === "string") {
+			return shorthandToTime(ttlInSeconds);
+		}
+
+		const currentTimestamp = Date.now(); // Current time in milliseconds
+		const ttlInMilliseconds = ttlInSeconds * 1000; // Convert TTL to milliseconds
+		const expirationTimestamp = currentTimestamp + ttlInMilliseconds;
+		return expirationTimestamp;
+	}
+
+	/**
+	 * Resolves a TTL value to an expiration timestamp, returning 0 (unlimited) if the
+	 * resolved timestamp is not in the future (e.g. "0s" or a zero-duration string).
+	 */
+	private resolveExpiration(ttl: number | string): number {
+		const timestamp = this.getExpirationTimestamp(ttl);
+		if (timestamp <= Date.now()) {
+			return 0;
+		}
+
+		return timestamp;
+	}
+
+	/**
+	 * Checks whether a TTL value is negative. Handles both numbers and
+	 * purely numeric strings (e.g. "-1").
+	 */
+	private isNegativeTtl(ttl?: number | string): boolean {
+		if (typeof ttl === "number") {
+			return ttl < 0;
+		}
+
+		if (typeof ttl === "string") {
+			const num = Number(ttl);
+			if (!Number.isNaN(num) && num < 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private checkData(): void {
+		for (const [key, value] of this.store.entries()) {
+			if (value.ttl > 0 && value.ttl < Date.now()) {
+				this.handleExpired(key, value);
+			}
+		}
+	}
+
+	/**
+	 * Handles expiration for a cache entry. Deletes the entry when
+	 * `deleteOnExpire` is enabled and emits the "expired" event.
+	 */
+	private handleExpired(key: string | number, entry: NodeCacheItem<T>): void {
+		const keyValue = this.formatKey(key);
+
+		if (this.options.deleteOnExpire) {
+			this.del(key);
+		}
+
+		this.emit("expired", keyValue, entry.value);
+	}
+
+	private createError(errorCode: string, key?: string): Error {
+		let error = errorCode;
+		/* v8 ignore next -- @preserve */
+		if (key) {
+			error = error.replace("__key", key);
+		}
+
+		return new Error(error);
+	}
+}
+
+export { NodeCacheStore, type NodeCacheStoreOptions } from "./store.js";
+export default NodeCache;
